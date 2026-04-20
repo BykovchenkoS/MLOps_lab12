@@ -1,24 +1,242 @@
 services:
+  # PostgreSQL for Airflow metadata
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - airflow_network
+
+  # PostgreSQL for MLflow (separate database)
+  mlflow-postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: mlflow
+      POSTGRES_DB: mlflow
+    volumes:
+      - mlflow_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - airflow_network
+
+  # MinIO S3-compatible object storage (also used as MLflow artifact store)
   minio:
-    image: minio/minio
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+    image: minio/minio:latest
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: server /data --console-address ":9001"
+    networks:
+      - airflow_network
 
-  spark-job:
+  # MinIO Client - Initialize buckets
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: |
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb local/datasets --ignore-existing;
+      mc mb local/models --ignore-existing;
+      mc mb local/experiments --ignore-existing;
+      mc mb local/mlflow --ignore-existing;
+      echo 'MinIO buckets created';
+      exit 0;
+      "
+    networks:
+      - airflow_network
+
+  # MLflow Tracking Server
+  mlflow-server:
+    image: ghcr.io/astral-sh/uv:python3.10-bookworm
+    depends_on:
+      mlflow-postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      UV_SYSTEM_PYTHON: "1"
+      MLFLOW_PORT: "5001"
+      MLFLOW_HOST: "0.0.0.0"
+      BACKEND_STORE_URI: "postgresql://mlflow:mlflow@mlflow-postgres:5432/mlflow"
+      DEFAULT_ARTIFACT_ROOT: "s3://mlflow"
+    volumes:
+      - mlflow_artifacts:/mlflow_artifacts
+    working_dir: /app
+    command: |
+      /bin/sh -c "
+      uv pip install --system mlflow psycopg2-binary boto3 &&
+      python -c \"
+      import os
+      import subprocess
+      import sys
+      
+      # Force the port via environment
+      os.environ['MLFLOW_PORT'] = '5001'
+      
+      # Run mlflow server with explicit args INCLUDING security settings
+      cmd = [
+          sys.executable, '-m', 'mlflow', 'server',
+          '--backend-store-uri', 'postgresql://mlflow:mlflow@mlflow-postgres:5432/mlflow',
+          '--default-artifact-root', 's3://mlflow',
+          '--host', '0.0.0.0',
+          '--port', '5001',
+          '--allowed-hosts', '*',
+          '--cors-allowed-origins', '*'
+      ]
+      print(f'Starting MLflow with: {cmd}')
+      subprocess.run(cmd)
+      \"
+      "
+    ports:
+      - "5001:5001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - airflow_network
+  
+
+  # Airflow Init
+  airflow-init:
     build: .
     depends_on:
-      - minio
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: '46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho='
+      AIRFLOW__CORE__DAGS_FOLDER: /workspace/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+      AIRFLOW_HOME: /workspace/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'airflow-secret-key-2024'
+      MINIO_URL: 'minio:9000'
+      MINIO_USER: 'minioadmin'
+      MINIO_PASSWORD: 'minioadmin'
+      MLFLOW_TRACKING_URI: 'http://mlflow-server:5001'
     volumes:
-      - ./spark_preprocess.py:/opt/spark/work-dir/spark_preprocess.py
-    working_dir: /opt/spark/work-dir
-    command: ["/opt/spark/bin/spark-submit", "--master", "local[*]", "--driver-memory", "2G", "--packages", "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262", "spark_preprocess.py"]
+      - ./dags:/workspace/dags
+      - dataset:/workspace/dataset
+      - ./source:/workspace/source
+      - ./config:/workspace/config
+      - experiments:/workspace/experiments
+      - airflow_home:/workspace/airflow
+      - ./init_airflow.sh:/workspace/init_airflow.sh
+    working_dir: /workspace
+    command: bash /workspace/init_airflow.sh
+    networks:
+      - airflow_network
+
+  # Airflow Webserver
+  airflow-webserver:
+    build: .
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      mlflow-server:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: '46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho='
+      AIRFLOW__CORE__DAGS_FOLDER: /workspace/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+      AIRFLOW_HOME: /workspace/airflow
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'airflow-secret-key-2024'
+      AIRFLOW__WEBSERVER__RBAC: 'True'
+      MINIO_URL: 'minio:9000'
+      MINIO_USER: 'minioadmin'
+      MINIO_PASSWORD: 'minioadmin'
+      MLFLOW_TRACKING_URI: 'http://mlflow-server:5001'
+    volumes:
+      - ./dags:/workspace/dags
+      - dataset:/workspace/dataset
+      - ./source:/workspace/source
+      - ./config:/workspace/config
+      - experiments:/workspace/experiments
+      - airflow_home:/workspace/airflow
+    working_dir: /workspace
+    command: airflow webserver --port 8080
+    ports:
+      - "8080:8080"
+    networks:
+      - airflow_network
+
+  # Airflow Scheduler
+  airflow-scheduler:
+    build: .
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      mlflow-server:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: '46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho='
+      AIRFLOW__CORE__DAGS_FOLDER: /workspace/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+      AIRFLOW_HOME: /workspace/airflow
+      MINIO_URL: 'minio:9000'
+      MINIO_USER: 'minioadmin'
+      MINIO_PASSWORD: 'minioadmin'
+      MLFLOW_TRACKING_URI: 'http://mlflow-server:5001'
+    volumes:
+      - ./dags:/workspace/dags
+      - dataset:/workspace/dataset
+      - ./source:/workspace/source
+      - ./config:/workspace/config
+      - experiments:/workspace/experiments
+      - airflow_home:/workspace/airflow
+    working_dir: /workspace
+    command: airflow scheduler
+    networks:
+      - airflow_network
+
+networks:
+  airflow_network:
+    driver: bridge
 
 volumes:
+  dataset:
+  experiments:
+  postgres_data:
+  mlflow_postgres_data:
+  mlflow_artifacts:
+  airflow_home:
   minio_data:
